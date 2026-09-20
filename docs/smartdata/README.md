@@ -41,4 +41,66 @@ Greenplum 6 живёт на ядре PostgreSQL 9.4 — релизе 2014 год
 
 ---
 
+## 🥚 А что если я хочу нормально побенчмаркать?
+
+Синтетические таблицы на две колонки — это, конечно, не бенчмарк. На стенде
+уже установлено расширение [`cbdb_tpcds`](https://github.com/avamingli/cbdb_tpcds):
+полный TPC-DS — генерация данных, загрузка, 99 запросов и отчёт — не выходя
+из `psql`.
+
+```sql
+CREATE EXTENSION tpcds;
+
+-- весь путь одной командой: SF=1, 1 воркер на сегмент, AOCS-хранение
+CALL tpcds.run(scale := 1, parallel := 1, storage_type := 'aocs');
+```
+
+На четырёх сегментах SF=1 проходит целиком примерно за пару минут. Дальше —
+отчёт:
+
+```sql
+SELECT tpcds.report();
+SELECT * FROM tpcds.bench_summary ORDER BY duration_ms DESC LIMIT 10;
+SELECT tpcds.gen_chart();          -- PNG с картинкой + CSV
+```
+
+Если хочется по шагам, а не одной кнопкой:
+
+```sql
+SELECT tpcds.gen_schema('aocs');   -- 25 таблиц TPC-DS
+SELECT tpcds.gen_data(1, 1);       -- dsdgen прямо на сегментах
+SELECT tpcds.load_data(16);        -- загрузка через gpfdist
+SELECT tpcds.gen_query();          -- 99 запросов из dsqgen
+SELECT tpcds.bench();              -- прогон
+```
+
+### Здесь-то фичи выше и встречаются
+
+TPC-DS — это 99 настоящих аналитических запросов, и на них интересно
+покрутить ровно те переключатели, о которых шла речь:
+
+```sql
+SELECT tpcds.show(14);                          -- посмотреть текст запроса
+SELECT tpcds.explain(14, 'ANALYZE, BUFFERS');   -- и его план
+
+SET enable_parallel = on;                       -- фича 04
+SET gp_anser_runtime_filter = on;               -- фича 03
+SELECT tpcds.exec(14);                          -- один запрос + тайминг
+```
+
+Запрос 14 — самый тяжёлый в наборе, его удобно запустить и открыть
+live-план в YAGPCC (фича 02), пока он идёт. А `tpcds.bench(optimizer := 'orca')`
+против `tpcds.bench(optimizer := 'postgres')` — готовое сравнение двух
+оптимизаторов на одинаковых данных.
+
+### Мелкий шрифт
+
+- Выше SF=1 нужна память: SF=100 — это 64 ГБ RAM и 8–16 сегментов, около
+  11 минут прогона. Самый чувствительный параметр — `statement_mem`.
+- `.dat`-файлы после загрузки не удаляются сами: `SELECT tpcds.clean_data();`.
+- Это **не официальные результаты TPC-DS** — для них нужен полный аудит
+  по спецификации.
+
+---
+
 Иллюстрации — в [`images/`](images/), карточки презентации — в [`cards/`](cards/).
