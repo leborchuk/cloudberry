@@ -29,19 +29,24 @@ Greenplum 6 живёт на ядре PostgreSQL 9.4 — релизе 2014 год
 
 Быстрый маршрут, если времени мало:
 
-1. **01** — тридцать секунд, пять строк в staging, один `MERGE`.
-2. **03** — `SET gp_anser_runtime_filter = on/off` на готовых таблицах
-   и сравнить `EXPLAIN ANALYZE`.
-3. **04** — `SET enable_parallel = on/off`, посмотреть на знаменатель
-   у `Gather Motion`.
-4. **02** — запустить долгий запрос и открыть его live-план в YAGPCC.
+1. [**01 — Ядро PostgreSQL 16**](01-postgres16-merge-into.md) — тридцать секунд,
+   пять строк в staging, один `MERGE`.
+2. [**03 — Anser**](03-anser-runtime-filter.md) — `SET gp_anser_runtime_filter = on/off`
+   на готовых таблицах и сравнить `EXPLAIN ANALYZE`.
+3. [**04 — Parallel join**](04-parallel-join.md) — `SET enable_parallel = on/off`,
+   посмотреть на знаменатель у `Gather Motion`.
+4. [**02 — YAGPCC 2.0**](02-yagpcc-2.0.md) — запустить долгий запрос и открыть
+   его live-план в YAGPCC.
 
 Наполнение данными для 03 и 04 занимает несколько минут — если таблицы уже
 созданы на стенде, начните сразу с запроса.
 
 ---
 
-## 🥚 А что если я хочу нормально побенчмаркать?
+<details>
+<summary><b>🥚 А что если я хочу нормально побенчмаркать?</b></summary>
+
+<br>
 
 Синтетические таблицы на две колонки — это, конечно, не бенчмарк. На стенде
 уже установлено расширение [`cbdb_tpcds`](https://github.com/avamingli/cbdb_tpcds):
@@ -100,6 +105,8 @@ live-план в YAGPCC (фича 02), пока он идёт. А `tpcds.bench(o
 - `.dat`-файлы после загрузки не удаляются сами: `SELECT tpcds.clean_data();`.
 - Это **не официальные результаты TPC-DS** — для них нужен полный аудит
   по спецификации.
+
+</details>
 
 ---
 
