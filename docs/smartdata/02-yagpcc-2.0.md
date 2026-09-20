@@ -27,6 +27,44 @@ YAGPCC 2.0 — интерфейс наблюдения и управления �
 
 Ключевая часть — **прогресс плана выполнения в реальном времени**.
 
+## Стенд: создаём таблицы
+
+```sql
+CREATE TABLE test (
+    id      serial primary key,
+    val     numeric,
+    txt     text,
+    created timestamp default now()
+);
+
+INSERT INTO test (val, txt)
+SELECT g % 1000, repeat('x', 100)
+FROM generate_series(1, 5000000) g;
+
+-- маленькая таблица-справочник, чтобы получить многоуровневый план
+CREATE TABLE dim (id int, label text) DISTRIBUTED REPLICATED;
+INSERT INTO dim SELECT g, 'label_' || g FROM generate_series(1, 64) g;
+
+ANALYZE test;
+ANALYZE dim;
+```
+
+Чтобы было что разглядывать в live-плане, нужен запрос, который живёт хотя бы
+десяток секунд. Подойдёт `NestLoop` над пятью миллионами строк:
+
+```sql
+SET enable_hashjoin = off;
+
+SELECT d.label, count(*)
+FROM test t, dim d
+WHERE t.val > d.id
+GROUP BY d.label
+ORDER BY 1;
+```
+
+Запустите его в одной сессии и откройте её в YAGPCC — план будет
+перерисовываться по мере выполнения.
+
 ## Как это устроено
 
 Напомним, что такое слайс. Слайс (slice) — горизонтальный срез плана,

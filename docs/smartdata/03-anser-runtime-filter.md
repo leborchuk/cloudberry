@@ -32,6 +32,138 @@ Custom Scan-узла:
 здесь покрыт только сценарий с добавлением Bloom-фильтров в план выполнения.
 Реализация — [Cloudberry PR #1942](https://github.com/apache/cloudberry/pull/1942).
 
+## Стенд: создаём таблицы
+
+Широкая «анкетная» таблица и таблица дополнительных полей к ней — обе
+column-oriented append-only, распределены по разным ключам, так что join
+неизбежно требует Motion.
+
+```sql
+CREATE TABLE applications
+(
+   id                    bigint,
+   first_name            character varying(32),
+   last_name             character varying(32),
+   patronymic            character varying(60),
+   birth_dt              timestamp(0) without time zone,
+   phone_mobile          character varying(16),
+   phone_work            character varying(16),
+   additional_work_phone character varying(16),
+   phone_home            character varying(16),
+   additional_phone_home character varying(16),
+   email                 character varying(50),
+   region                character varying(255),
+   product_category      character varying(50),
+   dt_created            timestamp(0) without time zone,
+   some_foreign_key_1    character varying(255),
+   some_foreign_key_2    character varying(255),
+   some_foreign_key_3    character varying(255),
+   some_foreign_key_4    character varying(255),
+   some_foreign_key_5    character varying(255),
+   some_foreign_key_6    character varying(255),
+   some_foreign_key_7    character varying(255),
+   some_foreign_key_8    character varying(255),
+   some_foreign_key_9    character varying(255),
+   some_foreign_key_10   character varying(255),
+   some_foreign_key_11   character varying(255),
+   some_foreign_key_12   character varying(255),
+   some_foreign_key_13   character varying(255),
+   some_foreign_key_14   character varying(255),
+   some_foreign_key_15   character varying(255),
+   some_foreign_key_16   character varying(255),
+   some_foreign_key_17   character varying(255)
+)
+WITH (APPENDONLY=true, ORIENTATION=column)
+DISTRIBUTED BY (id);
+
+CREATE TABLE applications_extra_fields
+(
+  id    bigint,
+  name  character varying(100),
+  value character varying(255)
+)
+WITH (APPENDONLY=true, ORIENTATION=column)
+DISTRIBUTED BY (name);
+```
+
+Миллион анкет:
+
+```sql
+INSERT INTO applications (
+    id, first_name, last_name, patronymic, birth_dt,
+    phone_mobile, phone_work, additional_work_phone,
+    phone_home, additional_phone_home, email,
+    region, product_category, dt_created,
+    some_foreign_key_1,  some_foreign_key_2,  some_foreign_key_3,
+    some_foreign_key_4,  some_foreign_key_5,  some_foreign_key_6,
+    some_foreign_key_7,  some_foreign_key_8,  some_foreign_key_9,
+    some_foreign_key_10, some_foreign_key_11, some_foreign_key_12,
+    some_foreign_key_13, some_foreign_key_14, some_foreign_key_15,
+    some_foreign_key_16, some_foreign_key_17
+)
+SELECT
+    gs AS id,
+    'FirstName'  || gs::text,
+    'LastName'   || gs::text,
+    'Patronymic' || gs::text,
+    (DATE '1980-01-01' + (gs % 15000))::timestamp,
+    '+7900' || lpad((gs % 10000000)::text, 7, '0'),
+    '+7495' || lpad((gs % 10000000)::text, 7, '0'),
+    '+7496' || lpad((gs % 10000000)::text, 7, '0'),
+    '+7499' || lpad((gs % 10000000)::text, 7, '0'),
+    '+7498' || lpad((gs % 10000000)::text, 7, '0'),
+    'user' || gs::text || '@example.com',
+    (ARRAY['Moscow','Saint Petersburg','Novosibirsk','Yekaterinburg','Kazan'])[1 + (gs % 5)],
+    (ARRAY['Loan','Credit Card','Mortgage','Deposit','Insurance'])[1 + (gs % 5)],
+    (TIMESTAMP '2024-01-01' + (gs || ' seconds')::interval),
+    'fk1_'  || gs::text, 'fk2_'  || gs::text, 'fk3_'  || gs::text,
+    'fk4_'  || gs::text, 'fk5_'  || gs::text, 'fk6_'  || gs::text,
+    'fk7_'  || gs::text, 'fk8_'  || gs::text, 'fk9_'  || gs::text,
+    'fk10_' || gs::text, 'fk11_' || gs::text, 'fk12_' || gs::text,
+    'fk13_' || gs::text, 'fk14_' || gs::text, 'fk15_' || gs::text,
+    'fk16_' || gs::text, 'fk17_' || gs::text
+FROM generate_series(1, 1000000) AS gs;
+```
+
+Дополнительные поля — по десять атрибутов на анкету. Здесь два режима, и
+разница между ними — весь смысл демонстрации:
+
+```sql
+-- Селективный вариант: 1000 строк, покрывают ~100 анкет из миллиона.
+-- Bloom-фильтр отбрасывает почти всю большую таблицу.
+INSERT INTO applications_extra_fields (id, name, value)
+SELECT
+    1 + ((gs - 1) / 10) AS id,
+    (ARRAY['passport_number','inn','snils','employment_status','monthly_income',
+           'employer_name','education_level','marital_status','dependents_count',
+           'address_registration'])[1 + ((gs - 1) % 10)] AS name,
+    'value_' || gs::text AS value
+FROM generate_series(1, 1000) AS gs;
+
+-- Неселективный вариант: 1 000 000 строк, покрывают всю большую таблицу.
+-- Фильтру нечего отбрасывать — видно чистый оверхед (см. раздел ниже).
+-- INSERT ... FROM generate_series(1, 1000000) AS gs;
+```
+
+```sql
+ANALYZE applications;
+ANALYZE applications_extra_fields;
+```
+
+Сам запрос — обычный `LEFT JOIN`, никаких подсказок оптимизатору:
+
+```sql
+SELECT aef.name, aef.value, aef.id, a.*
+FROM applications_extra_fields AS aef
+LEFT JOIN applications AS a ON aef.id = a.id;
+```
+
+Переключатель — один:
+
+```sql
+SET gp_anser_runtime_filter = on;   -- или off
+```
+
 ## Как это выглядит
 
 ```

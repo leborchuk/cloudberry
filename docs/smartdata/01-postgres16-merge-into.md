@@ -25,24 +25,50 @@ Greenplum 6 живёт на ядре PostgreSQL 9.4 — релизе 2014 год
 Классический сценарий загрузки — есть целевая таблица и staging-таблица,
 нужно обновить существующие строки и вставить новые.
 
+### Стенд: создаём таблицы
+
 ```sql
 CREATE TABLE users (
     id         BIGINT PRIMARY KEY,
     name       TEXT NOT NULL,
     email      TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE,
     is_active  BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+-- Индекс для ускорения JOIN по email (если нужно)
+CREATE INDEX idx_users_email ON users (email);
 
 CREATE TABLE users_staging (
     id           BIGINT NOT NULL,
     name         TEXT,
     email        TEXT,
-    status       TEXT,
-    last_seen_at TIMESTAMPTZ
+    status       TEXT,          -- например: 'active', 'inactive', 'pending'
+    last_seen_at TIMESTAMP WITH TIME ZONE
 );
+
+-- Индекс для ускорения соединения с users
+CREATE INDEX idx_users_staging_id ON users_staging (id);
 ```
+
+Наполняем staging:
+
+```sql
+INSERT INTO users_staging (id, email, name)
+VALUES
+  (1, 'user1@example.com', 'Alice Smith'),
+  (2, 'user2@example.com', 'Bob Jones'),
+  (3, 'user3@example.com', 'Carol Lee'),
+  (4, 'user4@example.com', 'David Kim'),
+  (5, 'user5@example.com', 'Eva Patel');
+```
+
+Таблица `users` пуста — значит, все пять строк должны уйти в ветку
+`WHEN NOT MATCHED`. Запустите `MERGE` второй раз, поправив что-нибудь
+в staging: те же пять строк пойдут уже через `WHEN MATCHED`.
+
+### Один запрос вместо связки
 
 **Cloudberry, ядро PostgreSQL 16:**
 

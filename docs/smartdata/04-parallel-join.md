@@ -20,6 +20,38 @@
 hash join'ы (и добавили `JOIN_RIGHT_ANTI`). До этого такие join'ы всегда
 выполнялись одним процессом на сегмент.
 
+## Стенд: создаём таблицы
+
+Две таблицы по 10 млн строк, распределённые по `id`, с частично
+пересекающимися диапазонами ключей — чтобы `FULL OUTER JOIN` дал работу
+обеим сторонам:
+
+```sql
+CREATE TABLE f_left  (id int, pad text) DISTRIBUTED BY (id);
+CREATE TABLE f_right (id int, pad text) DISTRIBUTED BY (id);
+
+INSERT INTO f_left  SELECT g,           repeat('l', 40) FROM generate_series(1,        10000000) g;
+INSERT INTO f_right SELECT g + 5000000, repeat('r', 40) FROM generate_series(1,        10000000) g;
+
+ANALYZE f_left;
+ANALYZE f_right;
+```
+
+Запрос и переключатели:
+
+```sql
+SET optimizer = off;                     -- параллельные FULL/RIGHT — под Postgres planner
+SET max_parallel_workers_per_gather = 8;
+
+SET enable_parallel = on;                -- или off
+
+EXPLAIN ANALYZE
+SELECT count(*) FROM f_left l FULL OUTER JOIN f_right r ON l.id = r.id;
+```
+
+Замеры с карточки сняты на стенде из 3 сегментов — соответственно `3:1`
+без параллелизма и `6:1` с ним.
+
 ## Цифры
 
 Одинаковый `FULL OUTER JOIN`, 10 млн × 10 млн строк:
@@ -31,7 +63,10 @@ hash join'ы (и добавили `JOIN_RIGHT_ANTI`). До этого такие
 
 Ускорение — **~1.7×**.
 
-## Ещё пример
+## Ещё пример: обычный INNER JOIN
+
+Параллелизм помогает не только на `FULL OUTER`. Большая probe-сторона
+и маленькая build-сторона:
 
 ```sql
 CREATE TABLE p_probe (id int, pad text) DISTRIBUTED BY (id);
