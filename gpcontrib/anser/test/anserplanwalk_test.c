@@ -48,6 +48,13 @@ counted_outer_plan(Plan *plan)
 
 static Plan *identity_filter;
 bool AnserIsRuntimeFilterScan(const Plan *plan) { return plan == identity_filter; }
+bool AnserIsFilterScan(const Plan *plan) { return plan == identity_filter; }
+
+static const Plan *test_consumer;
+AttrNumber AnserBloomConsumerKey(const Plan *plan)
+{
+	return plan == test_consumer ? 1 : InvalidAttrNumber;
+}
 
 void ExceptionalCondition(const char *a, const char *b, int c) { abort(); }
 
@@ -193,6 +200,146 @@ key_descent(void)
 	CHECK(!AnserResolveKeyScan(identity_filter, 1, 2, true, &parent, &resolved, &output, &slice));
 }
 
+/* A one-entry targetlist holding "var", in caller storage. */
+static List *
+one_entry_tlist(Var *var, TargetEntry *entry, ListCell *cell, List *list)
+{
+	var->xpr.type = T_Var;
+	entry->expr = (Expr *) var;
+	entry->resno = 1;
+	cell->ptr_value = entry;
+	list->type = T_List;
+	list->length = list->max_length = 1;
+	list->elements = cell;
+	return list;
+}
+
+static void
+record_inplace_probe(Plan *plan, AttrNumber key, HashJoin *join, void *arg)
+{
+	int *probes = (int *) arg;
+
+	CHECK(IsA(plan, SeqScan));
+	CHECK(key == 3);
+	CHECK(IsA(outerPlan(innerPlan(join)), HashJoin));
+	++*probes;
+}
+
+/*
+ * anser_inplace_has_target: down the outer side only, through HashJoin,
+ * Result, Append and our own nodes, to a SeqScan -- never through a Motion.
+ */
+static void
+inplace_target(void)
+{
+	SeqScan		scan = {0};
+	SeqScan		scan2 = {0};
+	HashJoin	join = {0};
+	HashJoin	lower = {0};
+	Hash		build = {0};
+	AnserInjectCtx ctx = {0};
+	int probes = 0;
+	Motion		motion = {0};
+	CustomScan	filter = {0};
+	Append		append = {0};
+	Var			vars[6] = {0};
+	TargetEntry entries[6] = {0};
+	ListCell	cells[6] = {{0}};
+	List		tlists[6] = {{0}};
+	List		children = {0};
+	ListCell	child_cells[2] = {{0}};
+
+	count_visits = false;
+	scan.scan.plan.type = T_SeqScan;
+	scan.scan.scanrelid = 1;
+	scan.scan.plan.targetlist = one_entry_tlist(&vars[0], &entries[0], &cells[0], &tlists[0]);
+	vars[0].varno = 1;
+	vars[0].varattno = 3;
+	scan2 = scan;
+	join.join.plan.type = T_HashJoin;
+
+	/* HashJoin over the scan. */
+	join.join.plan.lefttree = &scan.scan.plan;
+	CHECK(anser_inplace_has_target(&join, 1, false));
+	CHECK(!anser_inplace_has_target(&join, 2, false));
+	vars[0].varattno = 0;			/* a system column */
+	CHECK(!anser_inplace_has_target(&join, 1, false));
+	vars[0].varattno = 3;
+
+	/* A Motion between the scan and the join: the filter must be exchanged. */
+	motion.plan.type = T_Motion;
+	motion.plan.targetlist = one_entry_tlist(&vars[1], &entries[1], &cells[1], &tlists[1]);
+	vars[1].varno = OUTER_VAR;
+	vars[1].varattno = 1;
+	motion.plan.lefttree = &scan.scan.plan;
+	join.join.plan.lefttree = &motion.plan;
+	CHECK(!anser_inplace_has_target(&join, 1, false));
+
+	/* Through a lower join's outer side, not its inner side. */
+	lower.join.plan.type = T_HashJoin;
+	lower.join.plan.targetlist = one_entry_tlist(&vars[2], &entries[2], &cells[2], &tlists[2]);
+	lower.join.plan.lefttree = &scan.scan.plan;
+	vars[2].varno = OUTER_VAR;
+	vars[2].varattno = 1;
+	join.join.plan.lefttree = &lower.join.plan;
+	CHECK(anser_inplace_has_target(&join, 1, false));
+	vars[2].varno = INNER_VAR;
+	CHECK(!anser_inplace_has_target(&join, 1, false));
+	vars[2].varno = OUTER_VAR;
+	/* Not below the nullable outer side of a right or full join. */
+	lower.join.jointype = JOIN_RIGHT;
+	CHECK(!anser_inplace_has_target(&join, 1, false));
+	lower.join.jointype = JOIN_FULL;
+	CHECK(!anser_inplace_has_target(&join, 1, false));
+	lower.join.jointype = JOIN_LEFT;
+	CHECK(anser_inplace_has_target(&join, 1, false));
+	lower.join.jointype = JOIN_INNER;
+
+	/* Through one of our own nodes, and only when it says it only filters. */
+	filter.scan.plan.type = T_CustomScan;
+	filter.scan.plan.targetlist = one_entry_tlist(&vars[3], &entries[3], &cells[3], &tlists[3]);
+	vars[3].varno = INDEX_VAR;
+	vars[3].varattno = 1;
+	child_cells[0].ptr_value = &scan.scan.plan;
+	children.type = T_List;
+	children.length = children.max_length = 1;
+	children.elements = child_cells;
+	filter.custom_plans = &children;
+	lower.join.plan.lefttree = &filter.scan.plan;
+	identity_filter = NULL;			/* some other CustomScan */
+	CHECK(!anser_inplace_has_target(&join, 1, false));
+	identity_filter = &filter.scan.plan;	/* an identity filter */
+	CHECK(anser_inplace_has_target(&join, 1, false));
+	test_consumer = &filter.scan.plan;	/* a consumer on the same key */
+	CHECK(!anser_inplace_has_target(&join, 1, true));
+	test_consumer = NULL;
+	CHECK(anser_inplace_has_target(&join, 1, true));
+	vars[3].varno = OUTER_VAR;		/* not the identity tlist */
+	CHECK(!anser_inplace_has_target(&join, 1, false));
+	vars[3].varno = INDEX_VAR;
+
+	/* An Append whose children are all scans. */
+	append.plan.type = T_Append;
+	append.plan.targetlist = one_entry_tlist(&vars[4], &entries[4], &cells[4], &tlists[4]);
+	vars[4].varno = OUTER_VAR;
+	vars[4].varattno = 1;
+	child_cells[0].ptr_value = &scan.scan.plan;
+	child_cells[1].ptr_value = &scan2.scan.plan;
+	children.length = children.max_length = 2;
+	append.appendplans = &children;
+	join.join.plan.lefttree = &append.plan;
+	CHECK(anser_inplace_has_target(&join, 1, false));
+	build.plan.type = T_Hash;
+	build.plan.lefttree = &lower.join.plan;
+	join.join.plan.righttree = &build.plan;
+	ctx.visit_probe = record_inplace_probe;
+	ctx.visit_arg = &probes;
+	anser_report_inplace_probes(&join, 1, &ctx);
+	CHECK(probes == 2);
+	child_cells[1].ptr_value = &motion.plan;
+	CHECK(!anser_inplace_has_target(&join, 1, false));
+}
+
 int main(void)
 {
 	NodeTag tags[] = {T_Result, T_Append, T_MergeAppend, T_Sequence,
@@ -205,5 +352,6 @@ int main(void)
 		one_shape(tags[i], false);
 	one_shape(T_Result, true);
 	key_descent();
+	inplace_target();
 	return 0;
 }

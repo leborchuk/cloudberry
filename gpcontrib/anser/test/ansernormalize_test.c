@@ -57,6 +57,14 @@ bool bloom_lacks_element(bloom_filter *filter, unsigned char *value, size_t len)
 	return reject;
 }
 
+/* Adaptive probing is core's (bloomfilter.c); here it is on or off by hand. */
+static bool skip_probes;
+bool bloom_runtime_probe_skip(bloom_filter *filter) { return skip_probes; }
+bool bloom_runtime_probe(bloom_filter *filter, unsigned char *value, size_t len)
+{
+	return bloom_lacks_element(filter, value, len);
+}
+
 TupleDesc ExecGetResultType(PlanState *state) { return state->ps_ResultTupleDesc; }
 
 static void
@@ -96,11 +104,19 @@ scan_qual(ExprState *expr, ExprContext *context, bool *isnull)
 	return result;
 }
 
+static uint32
+runtime_filter_scan_flags(Relation rel)
+{
+	return SCAN_SUPPORT_RUNTIME_FILTER;
+}
+
 static void
 scan_qual_eligibility(void)
 {
 	SeqScan scan = {0};
 	SeqScanState state = {0};
+	RelationData relation = {0};
+	TableAmRoutine am = {0};
 	Var column = {0};
 	TargetEntry target = {0};
 	List tlist = {0};
@@ -133,6 +149,18 @@ scan_qual_eligibility(void)
 	state.filter_in_seqscan = true;
 	CHECK(AnserPushdownAccepts(&state.ss.ps, 1, &table_attno));
 	CHECK(table_attno == 7);
+	state.ss.ss_currentRelation = &relation;
+	relation.rd_tableam = &am;
+	relation.rd_amhandler = F_HEAP_TABLEAM_HANDLER;
+	CHECK(anser_runtime_qual_accepts(&state.ss.ps, 1, &table_attno));
+	relation.rd_amhandler = F_AO_COLUMN_TABLEAM_HANDLER;
+	CHECK(!anser_runtime_qual_accepts(&state.ss.ps, 1, &table_attno));
+	/* An AM that takes runtime filters (PAX) may replace the scan's qual. */
+	relation.rd_amhandler = F_HEAP_TABLEAM_HANDLER;
+	am.scan_flags = runtime_filter_scan_flags;
+	CHECK(!anser_runtime_qual_accepts(&state.ss.ps, 1, &table_attno));
+	am.scan_flags = NULL;
+	CHECK(AnserPushdownAccepts(&state.ss.ps, 1, &table_attno));
 	column.varno = 2;
 	CHECK(!anser_scan_qual_accepts(&state.ss.ps, 1, &table_attno));
 	column.varno = 1;
@@ -182,7 +210,8 @@ int main(void)
 		Datum high = ~(Datum) 0; /* -1, sign-extended by heap */
 
 		qual.key_length = lengths[i];
-		expected = low;
+		expected = high;	/* core's canonical form, sign-extended */
+		CHECK(AnserNormalizeBloomDatum(low, lengths[i]) == expected);
 		CHECK(AnserNormalizeBloomDatum(high, lengths[i]) == expected);
 		ExecAnserBloomFilterProduceAddDatum(&producer, low, false, lengths[i]);
 		ExecAnserBloomFilterProduceAddDatum(&producer, high, false, lengths[i]);
@@ -222,6 +251,23 @@ int main(void)
 		CHECK(original_calls == 0);
 		CHECK(instrumentation.nfiltered1 == lengthof(lengths) + 1);
 	}
+	/* A filter that turned itself off neither looks up nor rejects, but the
+	 * scan's own qual still runs. */
+	{
+		int before = lookups;
+
+		skip_probes = true;
+		reject = true;
+		original_calls = 0;
+		original_result = true;
+		CHECK(DatumGetBool(scan_qual(&qual.state, &context, &isnull)));
+		CHECK(lookups == before && original_calls == 1);
+		original_result = false;
+		CHECK(!DatumGetBool(scan_qual(&qual.state, &context, &isnull)));
+		CHECK(lookups == before && original_calls == 2);
+		skip_probes = false;
+		instrumentation.nfiltered1 = lengthof(lengths) + 1;
+	}
 	/* Negative int4 boundary values and arbitrary unused high bytes. */
 	{
 		int32 keys[] = {-1, -1000, PG_INT32_MIN, 0, PG_INT32_MAX};
@@ -229,7 +275,7 @@ int main(void)
 
 		for (k = 0; k < lengthof(keys); ++k)
 		{
-			expected = (Datum) (uint32) keys[k];
+			expected = Int64GetDatum((int64) keys[k]);
 			ExecAnserBloomFilterProduceAddDatum(&producer, Int32GetDatum(keys[k]),
 											  false, sizeof(int32));
 		}
